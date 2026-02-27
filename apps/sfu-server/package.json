@@ -1,0 +1,21 @@
+{
+  "name": "sfu-server",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node src/mediasoup-server.js",
+    "dev": "node --watch src/mediasoup-server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "httpolyglot": "^0.1.2",
+    "mediasoup": "^3.19.3"
+  }
+}
