@@ -1,92 +1,249 @@
+// /**
+//  * socketRegistry.ts
+//  *
+//  * Global in-memory map: socketId → ServerWebSocket
+//  *
+//  * This is how the Bun WS server pushes events (like 'new-producer' or
+//  * 'producer-closed') to specific clients — by looking up their socket here.
+//  *
+//  * Also maps socketId → roomName so the webhook handler can find all
+//  * peers in a room without calling mediasoup again.
+//  */
+
+// import type { ServerWebSocket } from 'bun'
+// import type { WSData }          from './index.js'
+
+// // socketId → WebSocket instance
+// const sockets = new Map<string, ServerWebSocket<WSData>>()
+
+// // socketId → roomName  (set when peer joins a room)
+// const socketRooms = new Map<string, string>()
+
+// // roomName → Set<socketId>  (fast room-level lookups)
+// const roomMembers = new Map<string, Set<string>>()
+
+// // ─── Socket Management ────────────────────────────────────────────────────────
+
+// export const registerSocket = (socketId: string, ws: ServerWebSocket<WSData>) => {
+//   sockets.set(socketId, ws)
+// }
+
+// export const unregisterSocket = (socketId: string) => {
+//   const roomName = socketRooms.get(socketId)
+//   if (roomName) {
+//     roomMembers.get(roomName)?.delete(socketId)
+//   }
+//   socketRooms.delete(socketId)
+//   sockets.delete(socketId)
+// }
+
+// export const getSocket = (socketId: string): ServerWebSocket<WSData> | undefined => {
+//   return sockets.get(socketId)
+// }
+
+// // ─── Room Management ──────────────────────────────────────────────────────────
+
+// export const joinRoom = (socketId: string, roomName: string) => {
+//   socketRooms.set(socketId, roomName)
+
+//   if (!roomMembers.has(roomName)) {
+//     roomMembers.set(roomName, new Set())
+//   }
+//   roomMembers.get(roomName)!.add(socketId)
+// }
+
+// export const getRoomForSocket = (socketId: string): string | undefined => {
+//   return socketRooms.get(socketId)
+// }
+
+// export const getRoomMembers = (roomName: string): string[] => {
+//   return Array.from(roomMembers.get(roomName) ?? [])
+// }
+
+// // ─── Push Helpers ─────────────────────────────────────────────────────────────
+
+// /**
+//  * Send a typed JSON message to a specific socket.
+//  */
+// export const sendTo = (socketId: string, type: string, payload: object) => {
+//   const ws = sockets.get(socketId)
+//   if (ws) {
+//     ws.send(JSON.stringify({ type, payload }))
+//   } else {
+//     console.warn(`[Registry] sendTo: socket ${socketId} not found`)
+//   }
+// }
+
+// /**
+//  * Send a typed JSON message to everyone in a room except the sender.
+//  */
+// export const broadcastToRoom = (
+//   roomName: string,
+//   excludeSocketId: string,
+//   type: string,
+//   payload: object
+// ) => {
+//   const members = roomMembers.get(roomName) ?? new Set()
+//   members.forEach(socketId => {
+//     if (socketId !== excludeSocketId) {
+//       sendTo(socketId, type, payload)
+//     }
+//   })
+// }
+
+
+// After the PUB/SUB
+
+
 /**
- * socketRegistry.ts
+ * src/socketRegistry.ts  (Redis-backed)
  *
- * Global in-memory map: socketId → ServerWebSocket
+ * EXPORTS EXACTLY THE SAME FUNCTIONS as the old in-memory version:
+ *   registerSocket, unregisterSocket, getSocket,
+ *   joinRoom, getRoomForSocket, getRoomMembers,
+ *   sendTo, broadcastToRoom
  *
- * This is how the Bun WS server pushes events (like 'new-producer' or
- * 'producer-closed') to specific clients — by looking up their socket here.
+ * Nothing else in the codebase needs to change.
  *
- * Also maps socketId → roomName so the webhook handler can find all
- * peers in a room without calling mediasoup again.
+ * How it works:
+ *
+ *   WebSocket objects physically live in process memory — they are OS TCP
+ *   sockets and cannot be serialised. So localSockets Map stays in-process.
+ *
+ *   Everything else (room membership, socket→room mapping) moves to Redis
+ *   so it survives restarts and is visible to future WS nodes.
+ *
+ *   broadcastToRoom now uses Redis PUBLISH so future WS nodes
+ *   automatically receive and forward messages to their local sockets.
  */
 
 import type { ServerWebSocket } from 'bun'
 import type { WSData }          from './index.js'
+import { pub, sub, K, TTL }     from './redis.js'
 
-// socketId → WebSocket instance
-const sockets = new Map<string, ServerWebSocket<WSData>>()
+// WebSocket handles — must stay in memory (cannot go to Redis)
+const localSockets = new Map<string, ServerWebSocket<WSData>>()
 
-// socketId → roomName  (set when peer joins a room)
-const socketRooms = new Map<string, string>()
+// Rooms this node has subscribed to on the pub/sub channel
+const subscribedChannels = new Set<string>()
 
-// roomName → Set<socketId>  (fast room-level lookups)
-const roomMembers = new Map<string, Set<string>>()
+// ── Socket lifecycle ───────────────────────────────────────────────────────────
 
-// ─── Socket Management ────────────────────────────────────────────────────────
+export const registerSocket = async (
+  socketId: string,
+  ws: ServerWebSocket<WSData>
+) => {
+  // Store handle locally
+  localSockets.set(socketId, ws)
 
-export const registerSocket = (socketId: string, ws: ServerWebSocket<WSData>) => {
-  sockets.set(socketId, ws)
+  // Store in Redis which node owns this socket
+  const nodeId = process.env.WS_NODE_ID || 'ws-node-1'
+  await pub.set(K.socket(socketId), nodeId)
+  await pub.send('EXPIRE', [K.socket(socketId), String(TTL.socket)])
 }
 
-export const unregisterSocket = (socketId: string) => {
-  const roomName = socketRooms.get(socketId)
+export const unregisterSocket = async (socketId: string) => {
+  // Get room before deleting — needed for SREM
+  const roomName = await getRoomForSocket(socketId)
+
+  localSockets.delete(socketId)
+
+  // Clean up Redis keys
+  await pub.send('DEL', [K.socket(socketId), K.socketRoom(socketId)])
+
   if (roomName) {
-    roomMembers.get(roomName)?.delete(socketId)
+    await pub.send('SREM', [K.roomMembers(roomName), socketId])
   }
-  socketRooms.delete(socketId)
-  sockets.delete(socketId)
 }
 
-export const getSocket = (socketId: string): ServerWebSocket<WSData> | undefined => {
-  return sockets.get(socketId)
+export const getSocket = (socketId: string) => localSockets.get(socketId)
+
+// ── Room membership ────────────────────────────────────────────────────────────
+
+export const joinRoom = async (socketId: string, roomName: string) => {
+  // Add to room SET in Redis
+  await pub.send('SADD',   [K.roomMembers(roomName), socketId])
+  await pub.send('EXPIRE', [K.roomMembers(roomName), String(TTL.room)])
+
+  // Track socket→room mapping
+  await pub.set(K.socketRoom(socketId), roomName)
+  await pub.send('EXPIRE', [K.socketRoom(socketId), String(TTL.socket)])
+
+  // Subscribe this node to the room's pub/sub channel (once per room per node)
+  await subscribeToRoomChannel(roomName)
 }
 
-// ─── Room Management ──────────────────────────────────────────────────────────
-
-export const joinRoom = (socketId: string, roomName: string) => {
-  socketRooms.set(socketId, roomName)
-
-  if (!roomMembers.has(roomName)) {
-    roomMembers.set(roomName, new Set())
-  }
-  roomMembers.get(roomName)!.add(socketId)
+export const getRoomForSocket = async (socketId: string): Promise<string | null> => {
+  return await pub.get(K.socketRoom(socketId))
 }
 
-export const getRoomForSocket = (socketId: string): string | undefined => {
-  return socketRooms.get(socketId)
+export const getRoomMembers = async (roomName: string): Promise<string[]> => {
+  const members = await pub.send('SMEMBERS', [K.roomMembers(roomName)])
+  return (members as string[]) ?? []
 }
 
-export const getRoomMembers = (roomName: string): string[] => {
-  return Array.from(roomMembers.get(roomName) ?? [])
-}
-
-// ─── Push Helpers ─────────────────────────────────────────────────────────────
+// ── Push helpers ───────────────────────────────────────────────────────────────
 
 /**
- * Send a typed JSON message to a specific socket.
+ * Send directly to a socket on THIS node.
+ * Used for responses (e.g. joinRoom-response) where we know the socket is local.
  */
 export const sendTo = (socketId: string, type: string, payload: object) => {
-  const ws = sockets.get(socketId)
+  const ws = localSockets.get(socketId)
   if (ws) {
     ws.send(JSON.stringify({ type, payload }))
   } else {
-    console.warn(`[Registry] sendTo: socket ${socketId} not found`)
+    console.warn(`[Registry] sendTo: ${socketId} not on this node`)
   }
 }
 
 /**
- * Send a typed JSON message to everyone in a room except the sender.
+ * Broadcast to everyone in a room via Redis PUBLISH.
+ * Every WS node (including this one) subscribed to the channel
+ * will receive the message and forward it to their local sockets.
+ *
+ * Same signature as the old in-memory broadcastToRoom —
+ * all call sites stay unchanged.
  */
-export const broadcastToRoom = (
+export const broadcastToRoom = async (
   roomName: string,
   excludeSocketId: string,
   type: string,
   payload: object
 ) => {
-  const members = roomMembers.get(roomName) ?? new Set()
-  members.forEach(socketId => {
-    if (socketId !== excludeSocketId) {
-      sendTo(socketId, type, payload)
+  await pub.send('PUBLISH', [
+    K.roomChannel(roomName),
+    JSON.stringify({ type, payload, excludeSocketId }),
+  ])
+}
+
+// ── Internal: subscribe this node to a room's channel ─────────────────────────
+
+const subscribeToRoomChannel = async (roomName: string) => {
+  const channel = K.roomChannel(roomName)
+  if (subscribedChannels.has(channel)) return   // already subscribed
+
+  await sub.subscribe(channel, async (rawMessage: string) => {
+    let msg: { type: string; payload: object; excludeSocketId: string }
+    try {
+      msg = JSON.parse(rawMessage)
+    } catch {
+      console.error('[Registry] pub/sub parse error:', rawMessage)
+      return
     }
+
+    const { type, payload, excludeSocketId } = msg
+
+    // Get current room members from Redis
+    const members = await getRoomMembers(roomName)
+
+    // Push to each socket that lives on THIS node
+    members.forEach(socketId => {
+      if (socketId === excludeSocketId) return
+      sendTo(socketId, type, payload)
+    })
   })
+
+  subscribedChannels.add(channel)
+  console.log(`[Registry] Subscribed to channel: ${channel}`)
 }
